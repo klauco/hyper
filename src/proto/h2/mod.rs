@@ -90,6 +90,11 @@ pin_project! {
         data_done: bool,
         #[pin]
         stream: S,
+        // Buffer a pending data chunk when we have body data but are waiting
+        // for flow control capacity. This allows us to only reserve capacity
+        // when we actually have data to send, instead of eagerly reserving
+        // 1 byte at the top of the loop.
+        pending_data: Option<(SendBuf<S::Data>, bool)>,
     }
 }
 
@@ -102,6 +107,7 @@ where
             body_tx: tx,
             data_done: false,
             stream,
+            pending_data: None,
         }
     }
 }
@@ -116,34 +122,53 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut me = self.project();
         loop {
-            // we don't have the next chunk of data yet, so just reserve 1 byte to make
-            // sure there's some capacity available. h2 will handle the capacity management
-            // for the actual body chunk.
-            me.body_tx.reserve_capacity(1);
-
-            if me.body_tx.capacity() == 0 {
-                loop {
-                    match ready!(me.body_tx.poll_capacity(cx)) {
-                        Some(Ok(0)) => {}
-                        Some(Ok(_)) => break,
-                        Some(Err(e)) => return Poll::Ready(Err(crate::Error::new_body_write(e))),
-                        None => {
-                            // None means the stream is no longer in a
-                            // streaming state, we either finished it
-                            // somehow, or the remote reset us.
-                            return Poll::Ready(Err(crate::Error::new_body_write(
-                                "send stream capacity unexpectedly closed",
-                            )));
+            // If we have pending data from a previous iteration (body produced
+            // data but we didn't have capacity), try to send it now.
+            if let Some((ref buf, _is_eos)) = *me.pending_data {
+                let len = buf.remaining();
+                me.body_tx.reserve_capacity(len);
+                if me.body_tx.capacity() == 0 {
+                    loop {
+                        match ready!(me.body_tx.poll_capacity(cx)) {
+                            Some(Ok(0)) => {}
+                            Some(Ok(_)) => break,
+                            Some(Err(e)) => {
+                                return Poll::Ready(Err(crate::Error::new_body_write(e)))
+                            }
+                            None => {
+                                return Poll::Ready(Err(crate::Error::new_body_write(
+                                    "send stream capacity unexpectedly closed",
+                                )));
+                            }
                         }
                     }
                 }
-            } else if let Poll::Ready(reason) = me
+                let (buf, is_eos) = me.pending_data.take().unwrap();
+                me.body_tx
+                    .send_data(buf, is_eos)
+                    .map_err(crate::Error::new_body_write)?;
+                if is_eos {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
+            }
+
+            // Poll the body FIRST to get data, BEFORE reserving any capacity.
+            // This way, if the body is not ready (Pending), we return Pending
+            // without holding any connection window capacity. The original code
+            // reserved 1 byte eagerly, which could starve other streams when
+            // many streams were waiting for body data simultaneously.
+
+            // Check for RST_STREAM while we have no pending data
+            if let Poll::Ready(reason) = me
                 .body_tx
                 .poll_reset(cx)
                 .map_err(crate::Error::new_body_write)?
             {
                 debug!("stream received RST_STREAM: {:?}", reason);
-                return Poll::Ready(Err(crate::Error::new_body_write(::h2::Error::from(reason))));
+                return Poll::Ready(Err(crate::Error::new_body_write(::h2::Error::from(
+                    reason,
+                ))));
             }
 
             match ready!(me.stream.as_mut().poll_frame(cx)) {
@@ -157,19 +182,44 @@ where
                             is_eos,
                         );
 
+                        let len = chunk.remaining();
                         let buf = SendBuf::Buf(chunk);
-                        me.body_tx
-                            .send_data(buf, is_eos)
-                            .map_err(crate::Error::new_body_write)?;
 
                         if is_eos {
+                            // Fast path: this is the last frame on the stream.
+                            // After send_data with eos=true, no subsequent
+                            // reserve_capacity call will occur, so the cross-stream
+                            // deadlock (caused by reserve_capacity inflating
+                            // buffered_send_data) cannot happen. Send directly
+                            // and let h2 handle internal buffering.
+                            me.body_tx.reserve_capacity(len);
+                            me.body_tx
+                                .send_data(buf, true)
+                                .map_err(crate::Error::new_body_write)?;
                             return Poll::Ready(Ok(()));
+                        }
+
+                        // Streaming (more data may follow): reserve exact capacity
+                        // for the actual chunk. This avoids the deadlock because we
+                        // only reserve when we have real data, not speculatively.
+                        me.body_tx.reserve_capacity(len);
+
+                        if me.body_tx.capacity() >= len {
+                            me.body_tx
+                                .send_data(buf, false)
+                                .map_err(crate::Error::new_body_write)?;
+                        } else {
+                            // Not enough capacity yet — store as pending
+                            // and loop back to wait for capacity
+                            *me.pending_data = Some((buf, false));
                         }
                     } else if frame.is_trailers() {
                         // no more DATA, so give any capacity back
                         me.body_tx.reserve_capacity(0);
                         me.body_tx
-                            .send_trailers(frame.into_trailers().unwrap_or_else(|_| unreachable!()))
+                            .send_trailers(
+                                frame.into_trailers().unwrap_or_else(|_| unreachable!()),
+                            )
                             .map_err(crate::Error::new_body_write)?;
                         return Poll::Ready(Ok(()));
                     } else {
